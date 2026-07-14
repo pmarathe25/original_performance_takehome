@@ -114,7 +114,13 @@ def _schedule_slots(slots, alpha=35, sched_bias=0, mode="height", block_of=None)
     succs = [dict() for _ in range(n)]
     indeg = [0] * n
     last_w = defaultdict(lambda: -1)
-    last_r = defaultdict(lambda: -1)
+    # All readers of an address since its last write. Every one of them must
+    # WAR-precede the next writer -- tracking only the *last* reader (the old
+    # behavior) leaves earlier readers unprotected, so the scheduler could
+    # legally hoist a writer ahead of an earlier reader and corrupt data. This
+    # bug is latent at the current address layout but surfaces whenever the
+    # layout shifts.
+    pending_readers = defaultdict(list)
 
     def add_edge(s, d, w):
         cur = succs[s].get(d)
@@ -137,11 +143,12 @@ def _schedule_slots(slots, alpha=35, sched_bias=0, mode="height", block_of=None)
                 # the same scratch address into strictly later cycles to keep
                 # emission-order semantics.
                 add_edge(j, i, 1)
-            j = last_r[a]
-            if j != -1:
-                add_edge(j, i, 0)  # war dep: end-of-cycle commit is safe here
+            for r in pending_readers[a]:
+                if r != i:
+                    add_edge(r, i, 0)  # war dep: end-of-cycle commit is safe
+            pending_readers[a] = []
         for a in reads_of[i]:
-            last_r[a] = i
+            pending_readers[a].append(i)
         for a in writes_of[i]:
             last_w[a] = i
 
