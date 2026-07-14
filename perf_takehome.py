@@ -93,7 +93,7 @@ def _slot_addresses(engine, slot):
     return reads, writes
 
 
-def _schedule_slots(slots):
+def _schedule_slots(slots, alpha=35, sched_bias=0, mode="height", block_of=None):
     """
     Pack a flat ordered list of (engine, slot) tuples into VLIW instruction
     bundles respecting:
@@ -152,6 +152,18 @@ def _schedule_slots(slots):
         if succs[i]:
             height[i] = max(height[i], max(1 + height[j] for j in succs[i]))
 
+    # ASAP / ALAP for mobility (slack) based prioritization.
+    asap = [0] * n
+    for i in range(n):
+        if succs[i]:
+            asap[i] = max(asap[j] + w for j, w in succs[i].items())
+    alap = [max(asap) if max(asap) > 0 else 1] * n
+    for i in range(n - 1, -1, -1):
+        for j, w in succs[i].items():
+            alap[i] = min(alap[i], alap[j] - w)
+    slack = [alap[i] - asap[i] for i in range(n)]
+    blk_of_int = [0 if b is None else b for b in block_of] if block_of else [0] * n
+
     ready_time = [0] * n
     ready = {i for i in range(n) if indeg[i] == 0}
     sched = [False] * n
@@ -162,7 +174,35 @@ def _schedule_slots(slots):
     # Engine pick order: scarce resources first (smallest SLOT_LIMITS) to fill
     # them while lots of work is available.
     eng_pick = ("load", "store", "flow", "valu", "alu", "debug")
-    alpha = 35  # weight on height priority; tuned empirically
+
+    def key_for(i):
+        eng = slots[i][0]
+        blk = blk_of_int[i]
+        if mode == "mobility":
+            return (slack[i], -height[i], i)
+        if mode == "mobility_i":
+            return (slack[i], i)
+        if mode == "asap":
+            return (asap[i], i)
+        if mode == "alap":
+            return (-alap[i], i)
+        if mode == "height_rev":
+            return (i + alpha * height[i], i)
+        if mode == "valu_prio":
+            # Prefer keeping the valu engine full: boost valu, demote loads so
+            # gathers spread out instead of bunching at the drain.
+            ebi = 0 if eng == "valu" else (5 if eng == "load" else 2)
+            return (i - alpha * height[i] + ebi * 1000, i)
+        if mode == "load_spread":
+            ebi = 0 if eng != "load" else 50
+            return (i - alpha * height[i] + ebi * 1000, i)
+        if mode == "blk_small":
+            # Mild nudge: finish earlier-emitted (lower block id) blocks first.
+            return (i - alpha * height[i] + sched_bias * blk, i)
+        if mode == "blk_large":
+            # Mild nudge: finish later-emitted (higher block id) blocks first.
+            return (i - alpha * height[i] - sched_bias * blk, i)
+        return (i - alpha * height[i], i)
 
     while count < n:
         if not ready:
@@ -171,8 +211,7 @@ def _schedule_slots(slots):
         heaps = {e: [] for e in SLOT_LIMITS}
         for i in ready:
             if ready_time[i] <= cycle:
-                heapq.heappush(heaps[slots[i][0]],
-                               (i - alpha * height[i], i))
+                heapq.heappush(heaps[slots[i][0]], key_for(i))
 
         progressed_any = False
         while True:
@@ -184,11 +223,11 @@ def _schedule_slots(slots):
                 if not heap:
                     continue
                 # Throw away stale entries (already scheduled elsewhere)
-                while heap and sched[heap[0][1]]:
+                while heap and sched[heap[0][-1]]:
                     heapq.heappop(heap)
                 if not heap:
                     continue
-                _, idx = heapq.heappop(heap)
+                idx = heapq.heappop(heap)[-1]
                 sched[idx] = True
                 count += 1
                 ready.discard(idx)
@@ -204,8 +243,7 @@ def _schedule_slots(slots):
                     if indeg[s] == 0:
                         ready.add(s)
                         if ready_time[s] <= cycle:
-                            heapq.heappush(heaps[slots[s][0]],
-                                           (s - alpha * height[s], s))
+                            heapq.heappush(heaps[slots[s][0]], key_for(s))
             if not progressed:
                 break
         if not progressed_any:
@@ -242,26 +280,30 @@ class KernelBuilder:
     def alloc_vec(self, name=None):
         return self.alloc_scratch(name, VLEN)
 
-    def scratch_const(self, val, name=None, slots=None):
+    def scratch_const(self, val, name=None, slots=None, emit=None):
         if val not in self.const_map:
             addr = self.alloc_scratch(name)
             s = ("load", ("const", addr, val))
             if slots is None:
                 self.instrs.append({"load": [s[1]]})
+            elif emit is not None:
+                emit(s)
             else:
                 slots.append(s)
             self.const_map[val] = addr
         return self.const_map[val]
 
-    def scratch_vconst(self, val, name=None, slots=None):
+    def scratch_vconst(self, val, name=None, slots=None, emit=None):
         if not hasattr(self, "_vconst_map"):
             self._vconst_map = {}
         if val not in self._vconst_map:
-            scalar = self.scratch_const(val, slots=slots)
+            scalar = self.scratch_const(val, slots=slots, emit=emit)
             addr = self.alloc_vec(name)
             s = ("valu", ("vbroadcast", addr, scalar))
             if slots is None:
                 self.instrs.append({"valu": [s[1]]})
+            elif emit is not None:
+                emit(s)
             else:
                 slots.append(s)
             self._vconst_map[val] = addr
@@ -270,7 +312,8 @@ class KernelBuilder:
     # ---- scheduling helpers ----
     def build_kernel(
         self, forest_height, n_nodes, batch_size, rounds,
-        group_size=22, round_tile=14, stagger=0,
+        group_size=22, round_tile=14, stagger=0, alpha=35,
+        sched_bias=1, mode="blk_large",
     ):
         """
         VLIW-packed tree-traversal kernel.
@@ -303,6 +346,11 @@ class KernelBuilder:
           8 scalar parity bits + offsets in parallel, then one VALU mul_add.
         """
         slots: list[tuple[Engine, tuple]] = []
+        block_of = []
+        _cur_block = [None]
+        def E(op):
+            slots.append(op)
+            block_of.append(_cur_block[0])
         blocks_per_round = batch_size // VLEN  # e.g. 32 blocks of 8 lanes
 
         # ----------------- Hard-coded mem layout (matches build_mem_image) -----------------
@@ -319,28 +367,28 @@ class KernelBuilder:
         forest_values_p = self.alloc_scratch("forest_values_p")
         inp_values_p = self.alloc_scratch("inp_values_p")
         block_offset = self.alloc_scratch("block_offset")
-        vlen_const = self.scratch_const(VLEN, "vlen_const", slots=slots)
+        vlen_const = self.scratch_const(VLEN, "vlen_const", slots=slots, emit=E)
 
         # Scalar constants used in setup
-        slots.append(("load", ("const", forest_values_p, FOREST_VALUES_P)))
-        slots.append(("load", ("const", inp_values_p, INP_VALUES_P)))
-        slots.append(("load", ("const", block_offset, 0)))
+        E(("load", ("const", forest_values_p, FOREST_VALUES_P)))
+        E(("load", ("const", inp_values_p, INP_VALUES_P)))
+        E(("load", ("const", block_offset, 0)))
 
         # Broadcasting VALU constants
-        one_vec = self.scratch_vconst(1, "v_one", slots=slots)
-        two_vec = self.scratch_vconst(2, "v_two", slots=slots)
-        four_vec = self.scratch_vconst(4, "v_four", slots=slots)
-        seven_vec = self.scratch_vconst(7, "v_seven", slots=slots)
+        one_vec = self.scratch_vconst(1, "v_one", slots=slots, emit=E)
+        two_vec = self.scratch_vconst(2, "v_two", slots=slots, emit=E)
+        four_vec = self.scratch_vconst(4, "v_four", slots=slots, emit=E)
+        seven_vec = self.scratch_vconst(7, "v_seven", slots=slots, emit=E)
 
         forest_vec = self.alloc_vec("v_forest_p")
-        slots.append(("valu", ("vbroadcast", forest_vec, forest_values_p)))
+        E(("valu", ("vbroadcast", forest_vec, forest_values_p)))
 
         # Pre-load 15 tree values (levels 0-3) into broadcast VALU vectors.
         num_preload = min(15, n_nodes)
         node_vecs = [None] * num_preload   # raw node broadcast vectors
         node_vecs_xor = []                 # (node ^ c6) broadcast vectors
         # c6 is needed during preload to fold node^c6; define it here.
-        h_c6_v = self.scratch_vconst(0xB55A4F09, "v_c6", slots=slots)
+        h_c6_v = self.scratch_vconst(0xB55A4F09, "v_c6", slots=slots, emit=E)
         # Only node_vecs[0] is used raw (round 0, level 0). Nodes 1..14 are used
         # solely to derive their ^c6 variants, so we broadcast them through a
         # single shared temp vector instead of keeping 14 permanent vectors.
@@ -351,20 +399,20 @@ class KernelBuilder:
         node_tmp_vecs = [self.alloc_vec(f"v_node_tmp_{k}") for k in range(POOL)]
         for i in range(num_preload):
             node_xor_vec = self.alloc_vec(f"v_nodeX_{i}")
-            i_const = self.scratch_const(i, slots=slots)
+            i_const = self.scratch_const(i, slots=slots, emit=E)
             addr_reg = tmp_addr if i % 2 == 0 else tmp_addr2
             nscal = node_scalars[i % POOL]
-            slots.append(("alu", ("+", addr_reg, forest_values_p, i_const)))
-            slots.append(("load", ("load", nscal, addr_reg)))
+            E(("alu", ("+", addr_reg, forest_values_p, i_const)))
+            E(("load", ("load", nscal, addr_reg)))
             if i == 0:
                 node0 = self.alloc_vec("v_node_0")
-                slots.append(("valu", ("vbroadcast", node0, nscal)))
+                E(("valu", ("vbroadcast", node0, nscal)))
                 node_vecs[0] = node0
                 bvec = node0
             else:
                 bvec = node_tmp_vecs[i % POOL]
-                slots.append(("valu", ("vbroadcast", bvec, nscal)))
-            slots.append(("valu", ("^", node_xor_vec, bvec, h_c6_v)))
+                E(("valu", ("vbroadcast", bvec, nscal)))
+            E(("valu", ("^", node_xor_vec, bvec, h_c6_v)))
             node_vecs_xor.append(node_xor_vec)
 
         # ----------------- Hash constants as broadcast VALU vectors -----------------
@@ -375,15 +423,15 @@ class KernelBuilder:
         #  3: ("+", 0xD3A2646C, "^", "<<", 9)   non-linear w/ add+shift
         #  4: ("+", 0xFD7046C5, "+", "<<", 3)   linear -> mul_add(a, 9, c5)
         #  5: ("^", 0xB55A4F09, "^", ">>", 16)  xor/shift combo / final
-        h_c1_v = self.scratch_vconst(0x7ED55D16, "v_c1", slots=slots)
-        h_mul0_v = self.scratch_vconst(1 + (1 << 12), "v_m0", slots=slots)  # 4097
-        h_c2_v = self.scratch_vconst(0xC761C23C, "v_c2", slots=slots)
-        h_sh1_v = self.scratch_vconst(19, "v_sh1", slots=slots)
+        h_c1_v = self.scratch_vconst(0x7ED55D16, "v_c1", slots=slots, emit=E)
+        h_mul0_v = self.scratch_vconst(1 + (1 << 12), "v_m0", slots=slots, emit=E)  # 4097
+        h_c2_v = self.scratch_vconst(0xC761C23C, "v_c2", slots=slots, emit=E)
+        h_sh1_v = self.scratch_vconst(19, "v_sh1", slots=slots, emit=E)
         # h_c3_v and h_c4_v are unused: their values are pre-baked into the
         # merged stages-2&3 constants (h_c34_v = c3+c4, h_c3L9_v = c3<<9).
-        h_c5_v = self.scratch_vconst(0xFD7046C5, "v_c5", slots=slots)
-        h_mul4_v = self.scratch_vconst(1 + (1 << 3), "v_m4", slots=slots)   # 9
-        h_sh5_v = self.scratch_vconst(16, "v_sh5", slots=slots)
+        h_c5_v = self.scratch_vconst(0xFD7046C5, "v_c5", slots=slots, emit=E)
+        h_mul4_v = self.scratch_vconst(1 + (1 << 3), "v_m4", slots=slots, emit=E)   # 9
+        h_sh5_v = self.scratch_vconst(16, "v_sh5", slots=slots, emit=E)
 
         # Merged stages-2&3 constants:
         #  stage 2: x = 33*a + c3            (linear, mul_add(a, 33, c3))
@@ -393,10 +441,10 @@ class KernelBuilder:
         C3, C4 = 0x165667B1, 0xD3A2646C
         C34 = (C3 + C4) % (2**32)
         C3L9 = (C3 << 9) % (2**32)
-        h_c34_v = self.scratch_vconst(C34, "v_c34", slots=slots)
-        h_mul16896_v = self.scratch_vconst(16896, "v_m16896", slots=slots)
-        h_mul33_v = self.scratch_vconst(33, "v_m33", slots=slots)
-        h_c3L9_v = self.scratch_vconst(C3L9, "v_c3L9", slots=slots)
+        h_c34_v = self.scratch_vconst(C34, "v_c34", slots=slots, emit=E)
+        h_mul16896_v = self.scratch_vconst(16896, "v_m16896", slots=slots, emit=E)
+        h_mul33_v = self.scratch_vconst(33, "v_m33", slots=slots, emit=E)
+        h_c3L9_v = self.scratch_vconst(C3L9, "v_c3L9", slots=slots, emit=E)
 
         # ----------------- Persistent batch idx & val scratch -----------------
         idx_blk = self.alloc_scratch("idx_blk", batch_size)        # 256 words
@@ -408,9 +456,9 @@ class KernelBuilder:
         # initialize all idx to 0 once and load the vals into val_blk.
         for b in range(blocks_per_round):
             # address: inp_values_p + block_offset
-            slots.append(("alu", ("+", tmp_addr, inp_values_p, block_offset)))
-            slots.append(("load", ("vload", val_blk + b * VLEN, tmp_addr)))
-            slots.append(("alu", ("+", block_offset, block_offset, vlen_const)))
+            E(("alu", ("+", tmp_addr, inp_values_p, block_offset)))
+            E(("load", ("vload", val_blk + b * VLEN, tmp_addr)))
+            E(("alu", ("+", block_offset, block_offset, vlen_const)))
 
         # idx_blk is implicitly zero (scratch is zero-init in Machine and
         # Input.generate also starts indices at 0), so we save 32 VALU ops.
@@ -427,8 +475,8 @@ class KernelBuilder:
             })
 
         # Scalar constants used by index update (in-scratch scalar)
-        one_const = self.scratch_const(1, slots=slots)
-        two_const = self.scratch_const(2, slots=slots)
+        one_const = self.scratch_const(1, slots=slots, emit=E)
+        two_const = self.scratch_const(2, slots=slots, emit=E)
 
         # ----------------- Helpers to emit per-batch delta -----------------
         def emit_tree_lookup(ctx, idx_v, val_v, level, use_xor_nodes,
@@ -438,7 +486,7 @@ class KernelBuilder:
                 # all lanes fetch the same root value (nodes[0])
                 # VALU is the bottleneck, so XOR lane-wise via scalar ALU.
                 for lane in range(VLEN):
-                    slots.append(("alu", ("^", val_v + lane, val_v + lane,
+                    E(("alu", ("^", val_v + lane, val_v + lane,
                                           nodes[0] + lane)))
             elif level == 1:
                 # L1SEL: at level 1 idx in {1,2} and (because the preceding
@@ -448,120 +496,120 @@ class KernelBuilder:
                 if reuse_parity:
                     cond = ctx["tmp3"]
                 else:
-                    slots.append(("valu", ("&", ctx["tmp1"], idx_v, one_vec)))
+                    E(("valu", ("&", ctx["tmp1"], idx_v, one_vec)))
                     cond = ctx["tmp1"]
-                slots.append(("flow", ("vselect", ctx["node"], cond,
+                E(("flow", ("vselect", ctx["node"], cond,
                                        nodes[1], nodes[2])))
                 for lane in range(VLEN):
-                    slots.append(("alu", ("^", val_v + lane, val_v + lane,
+                    E(("alu", ("^", val_v + lane, val_v + lane,
                                           ctx["node"] + lane)))
             elif level == 2:
                 # bit0 = idx & 1 ; bit1 = idx & 2 ; 4-way vselect chain.
                 # L1SEL: as with level 1, idx & 1 == parity (reused from the
                 # preceding index update in ctx["tmp3"]), saving one VALU '&'.
-                slots.append(("valu", ("&", ctx["tmp2"], idx_v, two_vec)))
+                E(("valu", ("&", ctx["tmp2"], idx_v, two_vec)))
                 if reuse_parity:
                     bit0 = ctx["tmp3"]
                     scratch = ctx["tmp1"]
                 else:
-                    slots.append(("valu", ("&", ctx["tmp1"], idx_v, one_vec)))
+                    E(("valu", ("&", ctx["tmp1"], idx_v, one_vec)))
                     bit0 = ctx["tmp1"]
                     scratch = ctx["tmp3"]
-                slots.append(("flow", ("vselect", scratch, ctx["tmp2"],
+                E(("flow", ("vselect", scratch, ctx["tmp2"],
                                        nodes[6], nodes[4])))
-                slots.append(("flow", ("vselect", ctx["node"], ctx["tmp2"],
+                E(("flow", ("vselect", ctx["node"], ctx["tmp2"],
                                        nodes[3], nodes[5])))
-                slots.append(("flow", ("vselect", ctx["node"], bit0,
+                E(("flow", ("vselect", ctx["node"], bit0,
                                        ctx["node"], scratch)))
-                slots.append(("valu", ("^", val_v, val_v, ctx["node"])))
+                E(("valu", ("^", val_v, val_v, ctx["node"])))
             elif level == 3:
                 # idx - 7 for lane-wise position-within-level (0..7) selection
-                slots.append(("valu", ("-", ctx["tmp1"], idx_v, seven_vec)))
+                E(("valu", ("-", ctx["tmp1"], idx_v, seven_vec)))
                 # bit0, bit1, bit2 of (idx-7)
-                slots.append(("valu", ("&", ctx["tmp2"], ctx["tmp1"], one_vec)))
-                slots.append(("valu", ("&", ctx["tmp3"], ctx["tmp1"], two_vec)))
-                slots.append(("flow", ("vselect", ctx["node"], ctx["tmp2"],
+                E(("valu", ("&", ctx["tmp2"], ctx["tmp1"], one_vec)))
+                E(("valu", ("&", ctx["tmp3"], ctx["tmp1"], two_vec)))
+                E(("flow", ("vselect", ctx["node"], ctx["tmp2"],
                                        nodes[8], nodes[7])))
-                slots.append(("flow", ("vselect", ctx["tmp1"], ctx["tmp2"],
+                E(("flow", ("vselect", ctx["tmp1"], ctx["tmp2"],
                                        nodes[10], nodes[9])))
-                slots.append(("flow", ("vselect", ctx["tmp1"], ctx["tmp3"],
+                E(("flow", ("vselect", ctx["tmp1"], ctx["tmp3"],
                                        ctx["tmp1"], ctx["node"])))
-                slots.append(("flow", ("vselect", ctx["node"], ctx["tmp2"],
+                E(("flow", ("vselect", ctx["node"], ctx["tmp2"],
                                        nodes[12], nodes[11])))
-                slots.append(("flow", ("vselect", ctx["tmp2"], ctx["tmp2"],
+                E(("flow", ("vselect", ctx["tmp2"], ctx["tmp2"],
                                        nodes[14], nodes[13])))
-                slots.append(("flow", ("vselect", ctx["node"], ctx["tmp3"],
+                E(("flow", ("vselect", ctx["node"], ctx["tmp3"],
                                        ctx["tmp2"], ctx["node"])))
-                slots.append(("valu", ("-", ctx["tmp3"], idx_v, seven_vec)))
-                slots.append(("valu", ("&", ctx["tmp3"], ctx["tmp3"], four_vec)))
-                slots.append(("flow", ("vselect", ctx["node"], ctx["tmp3"],
+                E(("valu", ("-", ctx["tmp3"], idx_v, seven_vec)))
+                E(("valu", ("&", ctx["tmp3"], ctx["tmp3"], four_vec)))
+                E(("flow", ("vselect", ctx["node"], ctx["tmp3"],
                                        ctx["node"], ctx["tmp1"])))
-                slots.append(("valu", ("^", val_v, val_v, ctx["node"])))
+                E(("valu", ("^", val_v, val_v, ctx["node"])))
             else:
                 # Gather: 8 lane-wise loads.
                 # tmp_lane[i] = forest_values_p + idx_lane[i]
                 for lane in range(VLEN):
-                    slots.append(("alu", ("+", ctx["node"] + lane,
+                    E(("alu", ("+", ctx["node"] + lane,
                                          forest_vec + lane, idx_v + lane)))
                 for lane in range(VLEN):
-                    slots.append(("load", ("load", ctx["tmp1"] + lane,
+                    E(("load", ("load", ctx["tmp1"] + lane,
                                            ctx["node"] + lane)))
                 # VALU is the bottleneck, so XOR lane-wise via scalar ALU
                 # (8 ALU ops instead of 1 VALU op).
                 for lane in range(VLEN):
-                    slots.append(("alu", ("^", val_v + lane, val_v + lane,
+                    E(("alu", ("^", val_v + lane, val_v + lane,
                                           ctx["tmp1"] + lane)))
 
         def emit_hash(ctx, val_v, defer_const):
             # stage 0: linear a = a*4097 + c1
-            slots.append(("valu", ("multiply_add", val_v, val_v,
+            E(("valu", ("multiply_add", val_v, val_v,
                                    h_mul0_v, h_c1_v)))
             # stage 1: a = (a ^ c2) ^ (a >> 19)
-            slots.append(("valu", (">>", ctx["tmp1"], val_v, h_sh1_v)))
-            slots.append(("valu", ("^", val_v, val_v, h_c2_v)))
-            slots.append(("valu", ("^", val_v, val_v, ctx["tmp1"])))
+            E(("valu", (">>", ctx["tmp1"], val_v, h_sh1_v)))
+            E(("valu", ("^", val_v, val_v, h_c2_v)))
+            E(("valu", ("^", val_v, val_v, ctx["tmp1"])))
             # stages 2 & 3 merged (see comment above):
             #   tmp1 = a*16896 + c3<<9    == (33*a + c3) << 9 == x << 9
             #   val  = a*33 + c3 + c4     == x + c4
             #   val ^= tmp1               == (x + c4) ^ (x << 9)   ✓ stage 3
-            slots.append(("valu", ("multiply_add", ctx["tmp1"], val_v,
+            E(("valu", ("multiply_add", ctx["tmp1"], val_v,
                                    h_mul16896_v, h_c3L9_v)))
-            slots.append(("valu", ("multiply_add", val_v, val_v,
+            E(("valu", ("multiply_add", val_v, val_v,
                                    h_mul33_v, h_c34_v)))
-            slots.append(("valu", ("^", val_v, val_v, ctx["tmp1"])))
+            E(("valu", ("^", val_v, val_v, ctx["tmp1"])))
             # stage 4: linear a = a*9 + c5
-            slots.append(("valu", ("multiply_add", val_v, val_v,
+            E(("valu", ("multiply_add", val_v, val_v,
                                    h_mul4_v, h_c5_v)))
             # stage 5: a = (a ^ c6) ^ (a >> 16)
             # If defer_const: the ^ c6 part is folded into next round's node XOR
             if defer_const:
-                slots.append(("valu", (">>", ctx["tmp2"], val_v, h_sh5_v)))
-                slots.append(("valu", ("^", val_v, val_v, ctx["tmp2"])))
+                E(("valu", (">>", ctx["tmp2"], val_v, h_sh5_v)))
+                E(("valu", ("^", val_v, val_v, ctx["tmp2"])))
             else:
-                slots.append(("valu", (">>", ctx["tmp2"], val_v, h_sh5_v)))
-                slots.append(("valu", ("^", val_v, val_v, h_c6_v)))
-                slots.append(("valu", ("^", val_v, val_v, ctx["tmp2"])))
+                E(("valu", (">>", ctx["tmp2"], val_v, h_sh5_v)))
+                E(("valu", ("^", val_v, val_v, h_c6_v)))
+                E(("valu", ("^", val_v, val_v, ctx["tmp2"])))
 
         def emit_index_update(ctx, idx_v, val_v, level, invert_parity=False):
             if level == forest_height:
                 # At level 10 every lane's child index exceeds n_nodes, so idx wraps to 0.
-                slots.append(("valu", ("^", idx_v, idx_v, idx_v)))
+                E(("valu", ("^", idx_v, idx_v, idx_v)))
                 return
             # 8 scalar-ALU parity bits packed into one vector register.
             # Kept in ctx["tmp3"] so the next round's L1 lookup can reuse it.
             for lane in range(VLEN):
-                slots.append(("alu", ("&", ctx["tmp3"] + lane,
+                E(("alu", ("&", ctx["tmp3"] + lane,
                                       val_v + lane, one_const)))
             # offset = parity + 1 (normal) or 2 - parity (deferred)
             for lane in range(VLEN):
                 if invert_parity:
-                    slots.append(("alu", ("-", ctx["tmp1"] + lane,
+                    E(("alu", ("-", ctx["tmp1"] + lane,
                                           two_const, ctx["tmp3"] + lane)))
                 else:
-                    slots.append(("alu", ("+", ctx["tmp1"] + lane,
+                    E(("alu", ("+", ctx["tmp1"] + lane,
                                           ctx["tmp3"] + lane, one_const)))
             # idx_new = 2*idx + offset
-            slots.append(("valu", ("multiply_add", idx_v, idx_v, two_vec,
+            E(("valu", ("multiply_add", idx_v, idx_v, two_vec,
                                    ctx["tmp1"])))
 
 # ----------------- Main tile loop (kernel body) -----------------
@@ -580,6 +628,7 @@ class KernelBuilder:
 
                 def emit_one(gi, rnd):
                     block = g_start + gi
+                    _cur_block[0] = block
                     level = rnd % (forest_height + 1)
                     # Defer c6 XOR into next round only when next level is
                     # preloadable (0-3) and there is a next round.
@@ -601,17 +650,19 @@ class KernelBuilder:
                                           invert_parity=invert_parity)
 
                     if is_last_round:
-                        if block == 0:
-                            slots.append(("load", ("const", block_offset,
-                                                   INP_VALUES_P)))
-                        slots.append(("store", ("vstore", block_offset, val_v)))
+                        E(("store", ("vstore", block_offset, val_v)))
                         if block < blocks_per_round - 1:
-                            slots.append(("alu", ("+", block_offset,
+                            E(("alu", ("+", block_offset,
                                                   block_offset, vlen_const)))
 
                 # Software-pipelined "wavefront" emission: block gi is offset by
                 # gi*stagger rounds so load-heavy (gather) and valu-heavy (hash)
                 # phases of different blocks overlap, balancing engine pressure.
+                # Reset the epilogue store-address base per group so the final
+                # vstores stay independent of emission/group ordering.
+                if is_last_tile:
+                    E(("load", ("const", block_offset,
+                                           INP_VALUES_P + g_start * VLEN)))
                 R = r_end - r_start
                 if stagger <= 0:
                     for gi in range(active_blocks):
@@ -626,7 +677,7 @@ class KernelBuilder:
                                 emit_one(gi, r_start + rr)
 
         # ----------------- Schedule and emit -----------------
-        self.instrs.extend(_schedule_slots(slots))
+        self.instrs.extend(_schedule_slots(slots, alpha=alpha, sched_bias=sched_bias, mode=mode, block_of=block_of))
 
 
 BASELINE = 147734
