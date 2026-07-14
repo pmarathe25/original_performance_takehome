@@ -270,7 +270,7 @@ class KernelBuilder:
     # ---- scheduling helpers ----
     def build_kernel(
         self, forest_height, n_nodes, batch_size, rounds,
-        group_size=21, round_tile=14, stagger=0,
+        group_size=22, round_tile=14, stagger=0,
     ):
         """
         VLIW-packed tree-traversal kernel.
@@ -329,7 +329,6 @@ class KernelBuilder:
         # Broadcasting VALU constants
         one_vec = self.scratch_vconst(1, "v_one", slots=slots)
         two_vec = self.scratch_vconst(2, "v_two", slots=slots)
-        three_vec = self.scratch_vconst(3, "v_three", slots=slots)
         four_vec = self.scratch_vconst(4, "v_four", slots=slots)
         seven_vec = self.scratch_vconst(7, "v_seven", slots=slots)
 
@@ -347,7 +346,7 @@ class KernelBuilder:
         # single shared temp vector instead of keeping 14 permanent vectors.
         # Rotating pool of staging scalars + temp vectors so the preload
         # broadcast->xor chains pipeline instead of serializing on one temp.
-        POOL = 4
+        POOL = 2
         node_scalars = [self.alloc_scratch(f"node_scalar_{k}") for k in range(POOL)]
         node_tmp_vecs = [self.alloc_vec(f"v_node_tmp_{k}") for k in range(POOL)]
         for i in range(num_preload):
