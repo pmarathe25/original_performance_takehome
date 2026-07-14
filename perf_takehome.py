@@ -152,16 +152,6 @@ def _schedule_slots(slots, alpha=35, sched_bias=0, mode="height", block_of=None)
         if succs[i]:
             height[i] = max(height[i], max(1 + height[j] for j in succs[i]))
 
-    # ASAP / ALAP for mobility (slack) based prioritization.
-    asap = [0] * n
-    for i in range(n):
-        if succs[i]:
-            asap[i] = max(asap[j] + w for j, w in succs[i].items())
-    alap = [max(asap) if max(asap) > 0 else 1] * n
-    for i in range(n - 1, -1, -1):
-        for j, w in succs[i].items():
-            alap[i] = min(alap[i], alap[j] - w)
-    slack = [alap[i] - asap[i] for i in range(n)]
     blk_of_int = [0 if b is None else b for b in block_of] if block_of else [0] * n
 
     ready_time = [0] * n
@@ -176,32 +166,12 @@ def _schedule_slots(slots, alpha=35, sched_bias=0, mode="height", block_of=None)
     eng_pick = ("load", "store", "flow", "valu", "alu", "debug")
 
     def key_for(i):
-        eng = slots[i][0]
-        blk = blk_of_int[i]
-        if mode == "mobility":
-            return (slack[i], -height[i], i)
-        if mode == "mobility_i":
-            return (slack[i], i)
-        if mode == "asap":
-            return (asap[i], i)
-        if mode == "alap":
-            return (-alap[i], i)
-        if mode == "height_rev":
-            return (i + alpha * height[i], i)
-        if mode == "valu_prio":
-            # Prefer keeping the valu engine full: boost valu, demote loads so
-            # gathers spread out instead of bunching at the drain.
-            ebi = 0 if eng == "valu" else (5 if eng == "load" else 2)
-            return (i - alpha * height[i] + ebi * 1000, i)
-        if mode == "load_spread":
-            ebi = 0 if eng != "load" else 50
-            return (i - alpha * height[i] + ebi * 1000, i)
-        if mode == "blk_small":
-            # Mild nudge: finish earlier-emitted (lower block id) blocks first.
-            return (i - alpha * height[i] + sched_bias * blk, i)
+        # Base priority: critical-path height (deeper ops first) with emission
+        # order as tie-break. The `blk_large` nudge additionally biases toward
+        # finishing later-emitted blocks first, which staggers block completion
+        # and de-bunches the load-heavy final-round gathers out of the drain.
         if mode == "blk_large":
-            # Mild nudge: finish later-emitted (higher block id) blocks first.
-            return (i - alpha * height[i] - sched_bias * blk, i)
+            return (i - alpha * height[i] - sched_bias * blk_of_int[i], i)
         return (i - alpha * height[i], i)
 
     while count < n:
